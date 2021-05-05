@@ -18,12 +18,14 @@ const logger = log4js.getLogger("Newegg Shopping Bot")
 logger.level = "trace"
 
 var TFA_wait = config.TFA_base_wait
+var do_oos_item_removal = false
+var oos_item_found = false
 
 /**
  * Sign into wegg
  * @param {*} page The page containing the element
  */
-async function signin(page, rl) {
+async function signin(page, rl, tryTimes = 3) {
 	//probably want to change code to looking at the specific html elements for determining which step/field page is asking for
 	
 	//look for email field and input email
@@ -60,13 +62,26 @@ async function signin(page, rl) {
 			logger.warn(`email 2FA is being asked, will reload in ${TFA_wait}s to skip it`)
 			await page.waitForTimeout(TFA_wait * 1000)
 			TFA_wait = Math.min(TFA_wait + config.TFA_wait_add, config.TFA_wait_cap)
-			
+
 			if (!page.url().includes('signin')) {
 				logger.info("2FA inputted while waiting")
 				logger.trace("Logged in")
 				TFA_wait = config.TFA_base_wait
+				return true
 			}
 			
+			if (tryTimes > 0) {
+				await page.click('a.signin-steps-back')
+				await page.waitForTimeout(1500)
+
+				await page.waitForSelector('#labeled-input-signEmail', { timeout: 2500 })
+				await page.waitForSelector('button.btn.btn-orange', { timeout: 2500 })
+				await page.click('button.btn.btn-orange')
+				await page.waitForTimeout(1500)
+		
+				return await signin(page, rl, tryTimes - 1)
+			}
+
 			return false
 		}
 
@@ -123,9 +138,7 @@ async function check_wishlist(page) {
 		if (await page.evaluate(element => element.disabled, await page.$(buttonElementName)) == true) throw 'No items found'
 	} catch (err) {
 		logger.error(err)
-		var nextCheckInSeconds = config.refresh_time + Math.floor(Math.random() * Math.floor(config.randomized_wait_ceiling))
-		logger.info(`The next attempt will be performed in ${nextCheckInSeconds} seconds`)
-		await page.waitForTimeout(nextCheckInSeconds * 1000)
+		await dynamicTimeout(page)
 		return false
 	}
 
@@ -141,24 +154,35 @@ async function check_wishlist(page) {
 async function check_cart(page, removed = false) {
 	const amountElementName = '.summary-content-total'
 	try {
-		await page.waitForSelector(amountElementName, { timeout: 2000 })
+		await page.waitForSelector(amountElementName, { timeout: 10000 })
 		var text = await page.evaluate(element => element.textContent, await page.$(amountElementName))
 		var price = parseInt(text.split('$')[1])
-		logger.info(`Subtotal of cart is ${price}`)
+
+		//taking a guess that item quantity increases when adding OOS items and when it comes in stock it'll have maxed quantity
+		//thus, am cleaning it on every search
+		//oos_item_removal(page)
+		
+		if (price > 0)
+			logger.info(`Subtotal of cart is ${price}`)
 
 		if (price === 0) {
 			if (removed)
 				logger.error("The last item removed exceeds the max price, cannot purchase item")
+			else if (config.use_itemlist) {
+				logger.error("No items were found in stock")
+				await dynamicTimeout(page)
+			}
 			else
 				logger.error("There are no items in the cart, item possibly went out of stock when adding to cart")
 			
+			//await oos_removal_disable(page)
 			return false
 		} else if (price > config.price_limit) {
 			if (config.over_price_limit_behavior === "stop") {
 				logger.error("Subtotal exceeds limit, stopping Newegg Shopping Bot process")
 				
 				while (true) {
-					
+					await page.waitForTimeout(500)
 				}
 			} else if (config.over_price_limit_behavior === "remove") {
 				logger.warn("Subtotal exceeds limit, removing an item from cart")
@@ -170,20 +194,76 @@ async function check_cart(page, removed = false) {
 				logger.trace("Successfully removed an item, checking cart")
 				await page.waitForTimeout(500)
 
+				//await oos_removal_disable(page)
 				return await check_cart(page, true)
 			} else {
 				logger.error("Price exceeds limit")
 			}
 			
+			//await oos_removal_disable(page)
 			return false
 		}
 		
+		//await oos_removal_disable(page)
 		logger.trace("Cart checked, attempting to purchase")
 		return true
 	} catch (err) {
+		//await oos_removal_disable(page)
 		logger.error(err.message)
 		return false
 	}
+}
+
+/**
+ * Remove the out of stock popup that when adding a OOS item to cart
+ * @param {*} page The page containing the element
+ */
+async function oos_item_removal(page) {
+	do_oos_item_removal = true
+	oos_item_found = true
+	var foundItem = false
+	while (true) {
+		foundItem = false
+		try {
+			await page.waitForFunction('document.querySelector("body").innerText.includes("Before You Continue...")', { timeout: 5000 })
+			const [button] = await page.$x("//button[contains(., 'ITEM(S)')]")
+			if (button) {
+				foundItem = true
+				logger.info("Remove OOS Item")
+				await button.click()
+			}
+		} catch (err) {
+			logger.info("no oos popup")
+		}
+		await page.waitForTimeout(500)
+		
+		oos_item_found = foundItem
+		if (do_oos_item_removal == false && foundItem == false)
+			break
+	}
+}
+
+/**
+ * disables and waits for the OOS item removal to finish
+ * @param {*} page The page containing the element
+ */
+async function oos_removal_disable(page) {
+	do_oos_item_removal = false
+	while (oos_item_found) {
+		await page.waitForTimeout(500)
+	}
+	
+	await page.waitForTimeout(1000)
+}
+
+/**
+ * Waits for a dynamic timeout based on the config refresh_time/randomized_wait_ceiling
+ * @param {*} page The page containing the element
+ */
+async function dynamicTimeout(page) {
+	var nextCheckInSeconds = config.refresh_time + Math.floor(Math.random() * Math.floor(config.randomized_wait_ceiling))
+	logger.info(`The next attempt will be performed in ${nextCheckInSeconds} seconds`)
+	await page.waitForTimeout(nextCheckInSeconds * 1000)
 }
 
 /**
@@ -203,6 +283,9 @@ async function inputCVV(page) {
 			logger.warn("Cannot find CVV input element")
 		}
 	}
+	
+	if (config.multi_step_order == false)
+		return true
 	
 	await page.waitForTimeout(250)
 	try {
@@ -265,13 +348,24 @@ async function run() {
 		output: process.stdout
 	})
 
+	//Needed for itemlist based operations, wishlist based automatically asks for signin
+	await page.goto('https://secure.newegg.' + config.site_domain, {waitUntil: 'networkidle0' })
+	await page.goto('https://secure.newegg.' + config.site_domain + '/NewMyAccount/AccountLogin.aspx?nextpage=https%3a%2f%2fwww.newegg.' + config.site_domain + '%2f' , {waitUntil: 'networkidle0' })
+	await signin(page, rl)
+
 	// Main loop
 	while (true) {
 		try {
-			await page.goto('https://secure.newegg.' + config.site_domain + '/wishlist/md/' + config.wishlist, { waitUntil: 'networkidle0' })
+			if (config.use_itemlist)
+				await page.goto('https://secure.newegg.' + config.site_domain + '/Shopping/AddtoCart.aspx?Submit=ADD&ItemList=' + config.itemlist, { waitUntil: 'networkidle0' })
+			else
+				await page.goto('https://secure.newegg.' + config.site_domain + '/wishlist/md/' + config.wishlist, { waitUntil: 'networkidle0' })
 
-			if (page.url().includes("/wishlist/md/")) {
+			//add option for "dentity/sessionexpire"
+			if (config.use_itemlist == false && page.url().includes("/wishlist/md/")) {
 				if (await check_wishlist(page) && await check_cart(page)) break
+			} else if (config.use_itemlist == true && (page.url().includes("/Shop/Cart") || page.url().includes("/shop/cart"))) {
+				if (await check_cart(page)) break
 			} else if (page.url().includes("signin")) {
 				//need to signin every so often
 				await signin(page, rl)
@@ -288,15 +382,20 @@ async function run() {
 		}
 	}
 	
+	//At one point was made to run async, might change functions for running non-async to not run inefficient code
+	oos_item_removal(page)
+	await oos_removal_disable(page)
+	
 	rl.close()
+	//need to make a thing: "I'm not interested." search for that button cuz covid popup thing
 
 	// Continuely attempts to press the Checkout/Continue checkout buttons, until getting to last checkout button
-	// This way no time is wasted in saying "Wait 10s" after pressing a button, no easy way to wait for networkidle after an ajax request
+	// This way no tme is wasted in saying "Wait 10s" after pressing a button, no easy way to wait for networkidle after an ajax request
 	while (true) {
 		try {
 			let button
 			
-			if (page.url().includes("Cart")) {
+			if (page.url().includes("Cart") || page.url().includes("cart")) {
 				button = await page.waitForXPath("//button[contains(., 'Secure Checkout')]", { timeout: 1000 })
 			} else if (page.url().includes("checkout")) {
 				button = await page.waitForXPath("//button[contains(., 'Continue to')]", { timeout: 1000 })
